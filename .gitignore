@@ -22,3 +22,16 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+.claude
+
+frontend/node_modules
+
+# Go
+/backend/bin/
+*.wasm
+
+# Local cluster / secrets
+kubeconfig*
+.env
+.env.*
