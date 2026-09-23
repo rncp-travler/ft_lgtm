@@ -1,0 +1,82 @@
+# grafana-community/grafana chart 13.2.5 (Grafana 13.2.x).
+# Exposed at grafana.lgtm.local by k8s/base/ingress.yaml.
+
+# Local development credentials only — never reuse these anywhere real.
+adminUser: admin
+adminPassword: admin
+
+persistence:
+  enabled: false
+
+ingress:
+  enabled: false
+
+# Datasource UIDs are fixed so the dashboards in dashboards/ can reference them.
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Mimir
+        uid: mimir
+        type: prometheus
+        access: proxy
+        url: http://mimir-gateway.observability.svc.cluster.local/prometheus
+        isDefault: true
+        jsonData:
+          httpMethod: POST
+          prometheusType: Mimir
+          # Metric -> Trace: clicking an exemplar opens the trace in Tempo.
+          exemplarTraceIdDestinations:
+            - name: trace_id
+              datasourceUid: tempo
+              urlDisplayLabel: View trace
+
+      - name: Loki
+        uid: loki
+        type: loki
+        access: proxy
+        url: http://loki-gateway.observability.svc.cluster.local
+        jsonData:
+          # Log -> Trace: trace_id arrives as OTLP structured metadata.
+          derivedFields:
+            - name: TraceID
+              matcherType: label
+              matcherRegex: trace_id
+              datasourceUid: tempo
+              url: "${__value.raw}"
+              urlDisplayLabel: View trace
+
+      - name: Tempo
+        uid: tempo
+        type: tempo
+        access: proxy
+        url: http://tempo.observability.svc.cluster.local:3200
+        jsonData:
+          # Trace -> Log: jump from a span to the logs of that same trace.
+          tracesToLogsV2:
+            datasourceUid: loki
+            spanStartTimeShift: -5m
+            spanEndTimeShift: 5m
+            filterByTraceID: true
+            customQuery: false
+          tracesToMetrics:
+            datasourceUid: mimir
+            spanStartTimeShift: -5m
+            spanEndTimeShift: 5m
+          serviceMap:
+            datasourceUid: mimir
+          nodeGraph:
+            enabled: true
+
+# Picks up any ConfigMap labelled grafana_dashboard=1; `make dashboards`
+# creates one from the dashboards/ directory.
+sidecar:
+  dashboards:
+    enabled: true
+    label: grafana_dashboard
+    labelValue: "1"
+    searchNamespace: ALL
+
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits: { cpu: "1", memory: 1Gi }

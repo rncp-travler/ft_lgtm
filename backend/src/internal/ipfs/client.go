@@ -37,11 +37,11 @@ func New(apiURL, gatewayURL string) *Client {
 // Upload adds data to IPFS (pinned, CIDv1) and returns its CID.
 func (c *Client) Upload(ctx context.Context, name string, data []byte) (cid string, err error) {
 	ctx, span := otel.Tracer("ft_lgtm/backend").Start(ctx, "ipfs.upload")
-	
+
 	defer span.End()
-	
+
 	span.SetAttributes(attribute.Int("ipfs.bytes", len(data)))
-	
+
 	defer func() {
 		if err != nil {
 			span.RecordError(err)
@@ -50,7 +50,7 @@ func (c *Client) Upload(ctx context.Context, name string, data []byte) (cid stri
 	}()
 
 	var body bytes.Buffer
-	
+
 	mw := multipart.NewWriter(&body)
 	fw, err := mw.CreateFormFile("file", name)
 	if err != nil {
@@ -65,11 +65,11 @@ func (c *Client) Upload(ctx context.Context, name string, data []byte) (cid stri
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.apiURL+"/api/v0/add?pin=true&cid-version=1", &body)
-	
-		if err != nil {
+
+	if err != nil {
 		return "", err
 	}
-	
+
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 
 	resp, err := c.http.Do(req)

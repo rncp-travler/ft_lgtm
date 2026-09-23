@@ -1,0 +1,34 @@
+# grafana-community/tempo chart 3.0.0 (Tempo 3.0.x), single binary.
+# Traces arrive from the Collector over OTLP/gRPC on 4317.
+tempo:
+  retention: 168h
+  storage:
+    trace:
+      backend: local
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  # Generates RED metrics and the service graph from spans, and writes them
+  # to Mimir. This is what powers the service map in Grafana.
+  metricsGenerator:
+    enabled: true
+    remoteWriteUrl: "http://mimir-gateway.observability.svc.cluster.local/api/v1/push"
+  # The generator only runs processors that are enabled per tenant; without
+  # this block it starts up and writes nothing.
+  overrides:
+    defaults:
+      metrics_generator:
+        processors:
+          - service-graphs
+          - span-metrics
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+persistence:
+  enabled: true
+  size: 10Gi

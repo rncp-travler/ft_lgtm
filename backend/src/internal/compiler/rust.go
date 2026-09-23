@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -16,6 +17,9 @@ import (
 )
 
 const Target = "wasm32-wasip1"
+
+// displayName is what the user's file is called in diagnostics and panics.
+const displayName = "main.rs"
 
 // ErrCompile means the user's code failed to compile; Output holds rustc's diagnostics.
 type ErrCompile struct{ Output string }
@@ -26,11 +30,6 @@ type Rust struct {
 	RustcPath string
 }
 
-// Compile runs rustc in a throwaway directory and returns the .wasm bytes.
-//
-// TODO(security): rustc runs untrusted input. Macros such as include_str!
-// can read any file the process can see, so the container must run as
-// non-root with a read-only root filesystem and no secrets mounted.
 func (r Rust) Compile(ctx context.Context, source string) (wasm []byte, err error) {
 	ctx, span := otel.Tracer("ft_lgtm/backend").Start(ctx, "compile")
 	defer span.End()
@@ -58,10 +57,14 @@ func (r Rust) Compile(ctx context.Context, source string) (wasm []byte, err erro
 		return nil, err
 	}
 
+	// The throwaway directory is an implementation detail, so keep its path out
+	// of what the user sees: --remap-path-prefix rewrites the paths baked into
+	// the module (panic messages), and the diagnostics are rewritten below.
 	cmd := exec.CommandContext(ctx, r.RustcPath,
 		"--edition", "2024",
 		"--target", Target,
 		"-C", "opt-level=1",
+		"--remap-path-prefix", src+"="+displayName,
 		"-o", out,
 		src,
 	)
@@ -79,12 +82,15 @@ func (r Rust) Compile(ctx context.Context, source string) (wasm []byte, err erro
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		// Deadline and client cancellation both kill rustc, and they mean
+		// different things to the caller, so hand the context error through
+		// unchanged rather than flattening both into one message.
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("compile timed out: %w", ctx.Err())
+			return nil, fmt.Errorf("compile: %w", ctx.Err())
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return nil, &ErrCompile{Output: stderr.String()}
+			return nil, &ErrCompile{Output: strings.ReplaceAll(stderr.String(), src, displayName)}
 		}
 		return nil, err
 	}

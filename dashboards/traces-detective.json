@@ -1,0 +1,91 @@
+{
+  "uid": "lgtm-traces",
+  "title": "LGTM - Traces Detective",
+  "description": "Find a slow or failed run, open its trace (HTTP -> compile -> execute -> ipfs.upload), then jump to the logs of that same trace.",
+  "tags": ["ft_lgtm"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "status",
+        "label": "Run status",
+        "type": "custom",
+        "query": "success,compile_error,runtime_error,timeout,internal_error",
+        "current": { "text": "timeout", "value": "timeout" },
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "How to use this dashboard",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "1. **Metric -> Trace**: on *Metrics Big Picture*, click an exemplar dot on the latency panel.\n2. **Trace**: the spans below are `POST /api/run` -> `compile` -> `execute` -> `ipfs.upload`. The slow stage is the widest bar.\n3. **Trace -> Log**: inside a span, use **Logs for this span** to see the Loki lines carrying the same `trace_id`."
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Recent runs with status $status",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"lgtm-backend\" && span.playground.status=\"$status\"}",
+          "limit": 20,
+          "tableType": "traces"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Stage duration p95 (from span metrics)",
+      "description": "Served by Tempo's metrics-generator, written into Mimir.",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 14 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "mimir" },
+          "expr": "histogram_quantile(0.95, sum by (le, span_name) (rate(traces_spanmetrics_latency_bucket{service=\"lgtm-backend\"}[5m])))",
+          "legendFormat": "{{span_name}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "logs",
+      "title": "Backend logs (Loki)",
+      "description": "Each line carries trace_id as structured metadata; the TraceID link opens Tempo.",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 14 },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "{service_name=\"lgtm-backend\"}",
+          "queryType": "range"
+        }
+      ]
+    }
+  ]
+}

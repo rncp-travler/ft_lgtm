@@ -1,0 +1,56 @@
+# Host routing (add these to /etc/hosts pointing at 127.0.0.1):
+#   lgtm.local          -> playground UI, /api -> backend
+#   ipfs.lgtm.local     -> IPFS read-only gateway
+#   grafana.lgtm.local  -> Grafana (lives in the observability namespace)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: playground
+  namespace: lgtm
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: lgtm.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port: { name: http }
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port: { name: http }
+    - host: ipfs.lgtm.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ipfs
+                port: { name: gateway }
+---
+# An Ingress can only target Services in its own namespace, so the
+# Grafana rule lives in the observability namespace.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: grafana.lgtm.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port: { number: 80 }

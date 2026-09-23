@@ -18,12 +18,12 @@ POST /api/run ──▶ compile ──▶ execute ──▶ ipfs.upload
    (otelhttp)     (rustc)     (wasmtime)   (kubo RPC)
 ```
 
-Traces, metrics and logs leave the backend over OTLP/gRPC, so they can be
-collected by an OpenTelemetry Collector and routed to the LGTM stack (Loki,
-Grafana, Tempo, Mimir). This repository holds the two services only; the
-collector, the LGTM deployment and the Grafana dashboards live outside it.
-Without a collector reachable at `OTEL_EXPORTER_OTLP_ENDPOINT` the exporters
-simply fail in the background and the playground keeps working.
+Traces, metrics and logs leave the backend over OTLP/gRPC, reach the
+OpenTelemetry Collector, and are routed to Tempo, Mimir and Loki. Grafana ties
+them together: an exemplar on a latency panel opens the trace, and a span links
+to the logs carrying the same `trace_id`.
+
+Everything runs on a local k3d cluster inside the VM — no cloud services.
 
 ### Sandbox limits
 
@@ -42,17 +42,66 @@ and no mounted secrets.
 
 ## Requirements
 
-- Go 1.27+ (cgo must work: wasmtime-go links a static library)
-- Rust 1.85+ with the `wasm32-wasip1` target (the compiler uses edition 2024)
-- Node.js 22+
-- Docker, only for `make images`
+A Debian 13.7.0 virtual machine with `sudo` and an internet connection. Nothing
+else has to be installed by hand: `make up` installs Docker, k3d, kubectl and
+helm itself, and the container images carry their own Go, Rust and Node.
+
+| Tool    | Installed by     | Used for                       |
+| ------- | ---------------- | ------------------------------ |
+| Docker  | `make packages`  | k3d runs the cluster in it     |
+| k3d     | `make packages`  | the local Kubernetes cluster   |
+| kubectl | `make packages`  | applying the manifests         |
+| helm    | `make packages`  | the LGTM charts                |
+
+Every install target is idempotent and skips a tool that is already present, so
+`make packages` is safe to re-run at any time. `make versions` prints what is
+installed.
 
 ## Instructions
 
 ```sh
-make install   # frontend dependencies + the Rust wasm target
+make up
+```
+
+That single command installs the tooling, creates the k3d cluster, builds and
+imports the two images, installs the LGTM stack, deploys the application,
+provisions the dashboards and adds the `/etc/hosts` entries. Then open:
+
+| URL                       | What                    |
+| ------------------------- | ----------------------- |
+| http://lgtm.local         | playground UI           |
+| http://grafana.lgtm.local | Grafana (admin / admin) |
+| http://ipfs.lgtm.local    | IPFS gateway            |
+
+Docker is installed with your user added to the `docker` group, which only
+takes effect on a new login. If `make up` stops and asks you to log out and
+back in, do that and run it again.
+
+Other targets: `make status`, `make logs`, `make down`, `make clean`,
+`make fclean`, `make re`. Run `make help` for the full list.
+
+### Local development without the cluster
+
+The services do not depend on Kubernetes — all configuration is environment
+variables — so the playground can be run directly on the host while working on
+it. This needs the host toolchains:
+
+```sh
+make install   # Go, Rust with the wasm32-wasip1 target, frontend dependencies
 make dev       # backend on :8080 and the Vite dev server on :5173
 ```
+
+Then open http://localhost:5173; the dev server proxies `/api` to the backend.
+`make check-wasm` compiles a sample program to `wasm32-wasip1` to prove the Rust
+toolchain is usable, and `make test` runs the backend tests and frontend checks.
+
+Go must satisfy the `go` directive in `backend/go.mod`, and Rust must be at
+least 1.85 because the compile stage passes `--edition 2024` to `rustc`. Both
+versions are pinned at the top of the Makefile: `make toolchain GO_VERSION=1.27.2`.
+
+Go lands in `/usr/local/go` and rustup in `~/.cargo`; the Makefile puts both on
+`PATH` for its own recipes, but add them to your shell profile to use `go` and
+`cargo` directly.
 
 Then open http://localhost:5173. The dev server proxies `/api` to the backend,
 so both halves work from that one URL.
@@ -109,14 +158,29 @@ them for you.
 ## Project layout
 
 ```
-├── Makefile                 build / run / test automation
+├── Makefile                 install / build / deploy / teardown automation
 ├── frontend/                Monaco-based playground UI (React + TypeScript + Vite)
 │   ├── Dockerfile           built bundle served by unprivileged nginx
 │   └── src/                 editor, run button, output panel, share link
-└── backend/                 Go API: rustc -> wasmtime -> IPFS, instrumented with OTel
-    ├── Dockerfile           Go build stage, Rust toolchain in the runtime stage
-    └── src/internal/        compiler, sandbox, ipfs, telemetry, api
+├── backend/                 Go API: rustc -> wasmtime -> IPFS, instrumented with OTel
+│   ├── Dockerfile           Go build stage, Rust toolchain in the runtime stage
+│   └── src/internal/        compiler, sandbox, ipfs, telemetry, api
+├── k8s/
+│   ├── k3d-config.yaml      local cluster definition, publishes 80/443
+│   ├── base/                frontend, backend, IPFS, Ingress
+│   └── observability/       OTel Collector + Helm values for the LGTM stack
+└── dashboards/              Grafana dashboards, provisioned by `make dashboards`
 ```
+
+## Observability walkthrough
+
+1. Run some code in the playground a few times, including something that loops
+   forever so it times out.
+2. Open **LGTM - Metrics Big Picture**: throughput, success rate and latency.
+3. Click an exemplar dot on the latency panel → the trace opens in Tempo,
+   showing which stage was slow.
+4. In a span, choose **Logs for this span** → Loki shows the log lines with the
+   same `trace_id`.
 
 ## Resources
 

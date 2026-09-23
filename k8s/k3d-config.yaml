@@ -1,0 +1,22 @@
+# Local cluster: k3d ships Traefik, which serves the Ingress resources.
+# Ports 80/443 are published on the host, so *.lgtm.local works through /etc/hosts.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: lgtm
+servers: 1
+agents: 1
+ports:
+  - port: 80:80
+    nodeFilters:
+      - loadbalancer
+  - port: 443:443
+    nodeFilters:
+      - loadbalancer
+options:
+  k3d:
+    wait: true
+    timeout: 5m
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true

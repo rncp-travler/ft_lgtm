@@ -1,0 +1,56 @@
+# kubo node. The RPC API (5001) stays cluster-internal; only the
+# read-only gateway (8080) is exposed through the Ingress.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ipfs
+  namespace: lgtm
+  labels: { app: ipfs }
+spec:
+  serviceName: ipfs
+  replicas: 1
+  selector:
+    matchLabels: { app: ipfs }
+  template:
+    metadata:
+      labels: { app: ipfs }
+    spec:
+      containers:
+        - name: kubo
+          image: ipfs/kubo:v0.43.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: swarm, containerPort: 4001 }
+            - { name: api, containerPort: 5001 }
+            - { name: gateway, containerPort: 8080 }
+          env:
+            - { name: IPFS_PROFILE, value: server }
+            # Bind the API to all interfaces so the backend Service can reach it.
+            - { name: IPFS_API_ADDR, value: "/ip4/0.0.0.0/tcp/5001" }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /data/ipfs }
+          readinessProbe:
+            tcpSocket: { port: api }
+            initialDelaySeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests: { storage: 5Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ipfs
+  namespace: lgtm
+spec:
+  selector: { app: ipfs }
+  ports:
+    - { name: api, port: 5001, targetPort: api }
+    - { name: gateway, port: 8080, targetPort: gateway }
+    - { name: swarm, port: 4001, targetPort: swarm }

@@ -35,3 +35,7 @@ frontend/node_modules
 kubeconfig*
 .env
 .env.*
+
+디렉토리설정.md
+requirements.md
+subject.pdf

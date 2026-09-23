@@ -87,6 +87,15 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := s.run(ctx, req.Code)
+
+	// The caller hung up (the UI's Cancel button, a closed tab). There is
+	// nobody left to answer, and counting it as a failure would skew the
+	// success rate on the metrics dashboard.
+	if ctx.Err() != nil {
+		slog.InfoContext(ctx, "run abandoned by client", "duration_ms", time.Since(start).Milliseconds())
+		return
+	}
+
 	resp.DurationMs = time.Since(start).Milliseconds()
 	resp.TraceID = trace.SpanContextFromContext(ctx).TraceID().String()
 
@@ -109,9 +118,14 @@ func (s *Server) run(ctx context.Context, code string) RunResponse {
 
 	if err != nil {
 		var ce *compiler.ErrCompile
-		if errors.As(err, &ce) {
+		switch {
+		case errors.As(err, &ce):
 			resp.Status, resp.Stderr, resp.ExitCode = StatusCompileError, ce.Output, 1
-		} else {
+		case errors.Is(err, context.Canceled):
+			return resp
+		case errors.Is(err, context.DeadlineExceeded):
+			resp.Status, resp.Stderr, resp.ExitCode = StatusTimeout, "compilation timed out", 1
+		default:
 			slog.ErrorContext(ctx, "compile failed", "error", err)
 			resp.Status, resp.Stderr, resp.ExitCode = StatusInternalError, err.Error(), 1
 			return resp
@@ -123,8 +137,10 @@ func (s *Server) run(ctx context.Context, code string) RunResponse {
 		switch {
 		case err == nil:
 			resp.Status = StatusSuccess
-		case errors.Is(err, sandbox.ErrTimeout):
+		case errors.Is(err, sandbox.ErrTimeout), errors.Is(err, context.DeadlineExceeded):
 			resp.Status = StatusTimeout
+		case errors.Is(err, context.Canceled):
+			return resp
 		case errors.As(err, &re):
 			resp.Status = StatusRuntimeError
 			if resp.Stderr == "" {
