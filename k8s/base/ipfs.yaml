@@ -1,5 +1,28 @@
 # kubo node. The RPC API (5001) stays cluster-internal; only the
 # read-only gateway (8080) is exposed through the Ingress.
+#
+# start_ipfs runs every /container-init.d/*.sh on each start, not just on the
+# first one, so this also reaches an already initialised volume.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ipfs-init
+  namespace: lgtm
+data:
+  01-gateway.sh: |
+    #!/bin/sh
+    set -e
+    # Declare the Ingress hostname as a path gateway. Without it kubo treats an
+    # unknown Host as a possible DNSLink name, and every request blocks on a TXT
+    # lookup for _dnslink.ipfs.lgtm.local that never resolves: ~10s per request.
+    ipfs config --json Gateway.PublicGateways '{
+      "ipfs.lgtm.local": {
+        "Paths": ["/ipfs", "/ipns"],
+        "UseSubdomains": false,
+        "NoDNSLink": true
+      }
+    }'
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -32,9 +55,15 @@ spec:
             limits: { cpu: "1", memory: 1Gi }
           volumeMounts:
             - { name: data, mountPath: /data/ipfs }
+            - { name: init, mountPath: /container-init.d }
           readinessProbe:
             tcpSocket: { port: api }
             initialDelaySeconds: 10
+      volumes:
+        - name: init
+          configMap:
+            name: ipfs-init
+            defaultMode: 0755
   volumeClaimTemplates:
     - metadata:
         name: data
