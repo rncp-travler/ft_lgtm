@@ -70,8 +70,9 @@ func (r Rust) Compile(ctx context.Context, source string) (wasm []byte, err erro
 	)
 	cmd.Dir = dir
 	// Deliberately minimal environment. RUSTUP_HOME/CARGO_HOME must be kept:
-	// the `rustc` in the image is a rustup shim that resolves its toolchain
-	// through them, and without them it cannot find a default toolchain.
+	// a rustup-managed `rustc` (local dev) is a shim that resolves its
+	// toolchain through them, and without them it cannot find a default
+	// toolchain. The container image ships a plain rustc and needs neither.
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir}
 	for _, key := range []string{"RUSTUP_HOME", "CARGO_HOME", "RUSTUP_TOOLCHAIN"} {
 		if v, ok := os.LookupEnv(key); ok {

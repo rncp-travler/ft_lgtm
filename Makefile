@@ -27,6 +27,27 @@ COMMUNITY_REPO  := https://grafana-community.github.io/helm-charts
 LOKI_VERSION    := 7.3.0
 TEMPO_VERSION   := 3.0.0
 GRAFANA_VERSION := 13.2.5
+VALUES_DIR      := k8s/observability/values
+
+# helm_install release,chart,version: install or upgrade one chart and wait.
+helm_install = helm upgrade --install $(1) $(2) --version $(3) -n $(OBS_NS) \
+	-f $(VALUES_DIR)/$(1)-values.yaml --wait --timeout 10m >/dev/null
+
+# Third-party images the stack runs, read from the rendered charts and
+# manifests so the list always follows the pinned versions. `images` pulls
+# them on the host and `load` imports them, so the host Docker cache survives
+# `make down` and a rebuilt cluster downloads nothing.
+STACK_IMAGES = { \
+	helm template loki grafana/loki --version $(LOKI_VERSION) --skip-tests -f $(VALUES_DIR)/loki-values.yaml; \
+	helm template tempo grafana-community/tempo --version $(TEMPO_VERSION) --skip-tests -f $(VALUES_DIR)/tempo-values.yaml; \
+	helm template grafana grafana-community/grafana --version $(GRAFANA_VERSION) --skip-tests -f $(VALUES_DIR)/grafana-values.yaml; \
+	kubectl kustomize k8s/observability; \
+	kubectl kustomize k8s/base; \
+	} 2>/dev/null | sed -n 's/^[[:space:]-]*image:[[:space:]]*//p' | tr -d "\"'" \
+	| grep -v '^ft_lgtm/' | sort -u
+
+# Single-node cluster (see K3D_CONFIG): every image lives on this node.
+K3D_NODE        := k3d-$(CLUSTER)-server-0
 
 # Host toolchains, only needed for `make dev` / `make test`; the container
 # images carry their own compilers. GO_VERSION must satisfy the `go` directive
@@ -58,7 +79,7 @@ RUSTUP_ENV := RUSTUP_HOME=$${RUSTUP_HOME:-$$HOME/.rustup} \
 
 .PHONY: all up packages install-apt install-docker install-k3d install-kubectl \
         install-helm check-docker install toolchain install-go install-rust \
-        versions check-wasm cluster images load observability deploy dashboards \
+        versions check-wasm cluster helm-repos images load observability deploy dashboards \
         hosts unhosts status logs dev back front build build-backend \
         build-frontend test lint fmt down clean fclean re help
 
@@ -243,20 +264,46 @@ cluster:
 		&& echo "cluster $(CLUSTER) already exists" \
 		|| k3d cluster create --config $(K3D_CONFIG)
 
-## images: build both container images
-images:
-	docker build -t $(BACKEND_IMAGE) ./$(BACKEND_DIR)
-	docker build -t $(FRONTEND_IMAGE) ./$(FRONTEND_DIR)
+## helm-repos: register and refresh the chart repositories
+helm-repos:
+	@helm repo add grafana $(GRAFANA_REPO) >/dev/null
+	@helm repo add grafana-community $(COMMUNITY_REPO) >/dev/null
+	@helm repo update >/dev/null
 
-## load: import the locally built images into the cluster
-load:
-	k3d image import $(BACKEND_IMAGE) $(FRONTEND_IMAGE) -c $(CLUSTER)
+## images: build both app images while the stack images are pulled on the host
+images: helm-repos
+	@echo "[pull]   pulling the stack images in the background"
+	@$(STACK_IMAGES) | xargs -n 1 -P 4 docker pull -q >/dev/null & pull=$$!; \
+	docker build -t $(BACKEND_IMAGE) ./$(BACKEND_DIR) \
+		&& docker build -t $(FRONTEND_IMAGE) ./$(FRONTEND_DIR); \
+	built=$$?; \
+	if wait $$pull; then echo "[pull]   stack images ready on the host"; \
+	else echo "[pull]   some stack images failed to pull, the cluster will fetch those itself"; fi; \
+	exit $$built
+
+## load: import the app images, and the stack images the cluster lacks
+# Not `k3d image import`: with Docker's containerd image store, `docker save`
+# lists every platform of a pulled image but only holds the local one, the
+# node's import then fails on the missing content, and k3d still reports
+# success. Saving the node's platform only and importing it directly avoids
+# that and lets a failure stop the build. Older Docker without
+# `save --platform` uses the classic store, which never has the problem.
+load: helm-repos
+	@imgs="$(BACKEND_IMAGE) $(FRONTEND_IMAGE)"; \
+	for i in $$($(STACK_IMAGES)); do \
+		docker image inspect "$$i" >/dev/null 2>&1 || continue; \
+		docker exec $(K3D_NODE) crictl inspecti "$$i" >/dev/null 2>&1 && continue; \
+		imgs="$$imgs $$i"; \
+	done; \
+	platform=; \
+	docker save --help 2>/dev/null | grep -q -- '--platform' && platform="--platform linux/$(ARCH)"; \
+	echo "[load]   importing into $(K3D_NODE):"; \
+	printf '           %s\n' $$imgs; \
+	docker save $$platform $$imgs \
+		| docker exec -i $(K3D_NODE) ctr -n k8s.io images import - >/dev/null
 
 ## observability: install the LGTM stack and the OpenTelemetry Collector
-observability:
-	helm repo add grafana $(GRAFANA_REPO) >/dev/null
-	helm repo add grafana-community $(COMMUNITY_REPO) >/dev/null
-	helm repo update >/dev/null
+observability: helm-repos
 	@# Clusters set up before the switch still carry the mimir-distributed
 	@# release, which owns the mimir-gateway Service; drop it and its volumes.
 	@if helm status mimir -n $(OBS_NS) >/dev/null 2>&1; then \
@@ -265,16 +312,23 @@ observability:
 		kubectl -n $(OBS_NS) delete pvc -l app.kubernetes.io/instance=mimir --ignore-not-found; \
 	fi
 	kubectl apply -k k8s/observability
-	kubectl -n $(OBS_NS) rollout status statefulset/mimir --timeout=10m
-	helm upgrade --install loki grafana/loki \
-		--version $(LOKI_VERSION) -n $(OBS_NS) \
-		-f k8s/observability/values/loki-values.yaml --wait --timeout 10m
-	helm upgrade --install tempo grafana-community/tempo \
-		--version $(TEMPO_VERSION) -n $(OBS_NS) \
-		-f k8s/observability/values/tempo-values.yaml --wait --timeout 10m
-	helm upgrade --install grafana grafana-community/grafana \
-		--version $(GRAFANA_VERSION) -n $(OBS_NS) \
-		-f k8s/observability/values/grafana-values.yaml --wait --timeout 10m
+	@# The four backends do not depend on each other at install time (Tempo
+	@# retries its remote write until Mimir is up), so wait for them together.
+	@echo "[obs]    installing loki, tempo and grafana alongside mimir"
+	@kubectl -n $(OBS_NS) rollout status statefulset/mimir --timeout=10m >/dev/null & mimir=$$!; \
+	$(call helm_install,loki,grafana/loki,$(LOKI_VERSION)) & loki=$$!; \
+	$(call helm_install,tempo,grafana-community/tempo,$(TEMPO_VERSION)) & tempo=$$!; \
+	$(call helm_install,grafana,grafana-community/grafana,$(GRAFANA_VERSION)) & grafana=$$!; \
+	failed=; \
+	for job in mimir:$$mimir loki:$$loki tempo:$$tempo grafana:$$grafana; do \
+		if wait $${job#*:}; then echo "[obs]    $${job%%:*} ready"; \
+		else echo "[obs]    $${job%%:*} FAILED"; failed=1; fi; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		kubectl -n $(OBS_NS) get pods; \
+		kubectl -n $(OBS_NS) get events --sort-by=.lastTimestamp | tail -20; \
+		exit 1; \
+	fi
 	kubectl -n $(OBS_NS) rollout restart deployment/otel-collector
 	kubectl -n $(OBS_NS) rollout status deployment/otel-collector --timeout=5m
 
