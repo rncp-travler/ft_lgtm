@@ -56,6 +56,13 @@ data:
       filesystem:
         dir: /data/rules
 
+    # Both default to paths relative to the working directory, which the
+    # non-root user cannot write to; keep them on the volume.
+    activity_tracker:
+      filepath: /data/metrics-activity.log
+    ruler:
+      rule_path: /data/ruler
+
     limits:
       # Exemplars are the Metric -> Trace jump in Grafana; without this they
       # are dropped on ingest.
