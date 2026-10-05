@@ -1,0 +1,126 @@
+# Mimir 3.2 in monolithic mode (-target=all) with filesystem block storage,
+# the same shape as Loki (SingleBinary) and Tempo (local backend). The
+# mimir-distributed chart is not used: it needs MinIO, whose images are no
+# longer publicly pullable, plus Kafka and ten more pods.
+# Metrics arrive from the Collector over OTLP (/otlp/v1/metrics) and from the
+# Tempo metrics generator over remote write (/api/v1/push).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mimir-config
+  namespace: observability
+data:
+  mimir.yaml: |
+    multitenancy_enabled: false
+
+    server:
+      http_listen_port: 8080
+      grpc_listen_port: 9095
+      log_level: warn
+
+    # Classic write path; the ingest storage architecture would need Kafka.
+    ingest_storage:
+      enabled: false
+
+    blocks_storage:
+      backend: filesystem
+      filesystem:
+        dir: /data/blocks
+      bucket_store:
+        sync_dir: /data/tsdb-sync
+      tsdb:
+        dir: /data/tsdb
+
+    compactor:
+      data_dir: /data/compactor
+      sharding_ring:
+        kvstore: { store: memberlist }
+
+    distributor:
+      ring:
+        instance_addr: 127.0.0.1
+        kvstore: { store: memberlist }
+
+    ingester:
+      ring:
+        instance_addr: 127.0.0.1
+        kvstore: { store: memberlist }
+        replication_factor: 1
+
+    store_gateway:
+      sharding_ring:
+        replication_factor: 1
+
+    ruler_storage:
+      backend: filesystem
+      filesystem:
+        dir: /data/rules
+
+    limits:
+      # Exemplars are the Metric -> Trace jump in Grafana; without this they
+      # are dropped on ingest.
+      max_global_exemplars_per_user: 100000
+      native_histograms_ingestion_enabled: true
+      compactor_blocks_retention_period: 168h
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mimir
+  namespace: observability
+  labels: { app: mimir }
+spec:
+  replicas: 1
+  serviceName: mimir
+  selector:
+    matchLabels: { app: mimir }
+  template:
+    metadata:
+      labels: { app: mimir }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: mimir
+          image: grafana/mimir:3.2.0
+          args:
+            - -target=all
+            - -config.file=/etc/mimir/mimir.yaml
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: grpc, containerPort: 9095 }
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            limits: { cpu: "1", memory: 2Gi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/mimir }
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: config
+          configMap: { name: mimir-config }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: { storage: 10Gi }
+---
+# Kept under the old chart's gateway name, so the Collector, Grafana and the
+# Tempo metrics generator need no changes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimir-gateway
+  namespace: observability
+spec:
+  selector: { app: mimir }
+  ports:
+    - { name: http, port: 80, targetPort: http }

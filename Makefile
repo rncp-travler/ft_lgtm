@@ -20,11 +20,11 @@ BACKEND_IMAGE  := ft_lgtm/backend:dev
 HOSTS_LINE     := 127.0.0.1 lgtm.local grafana.lgtm.local ipfs.lgtm.local
 
 # Chart versions are pinned; the grafana and tempo charts moved to the
-# grafana-community repo, loki and mimir are still in the grafana repo.
+# grafana-community repo, loki is still in the grafana repo. Mimir is not a
+# chart, it is a plain manifest in k8s/observability/mimir.yaml.
 GRAFANA_REPO    := https://grafana.github.io/helm-charts
 COMMUNITY_REPO  := https://grafana-community.github.io/helm-charts
 LOKI_VERSION    := 7.3.0
-MIMIR_VERSION   := 6.2.0
 TEMPO_VERSION   := 3.0.0
 GRAFANA_VERSION := 13.2.5
 
@@ -257,10 +257,15 @@ observability:
 	helm repo add grafana $(GRAFANA_REPO) >/dev/null
 	helm repo add grafana-community $(COMMUNITY_REPO) >/dev/null
 	helm repo update >/dev/null
+	@# Clusters set up before the switch still carry the mimir-distributed
+	@# release, which owns the mimir-gateway Service; drop it and its volumes.
+	@if helm status mimir -n $(OBS_NS) >/dev/null 2>&1; then \
+		echo "removing the old mimir-distributed release"; \
+		helm uninstall mimir -n $(OBS_NS) --wait; \
+		kubectl -n $(OBS_NS) delete pvc -l app.kubernetes.io/instance=mimir --ignore-not-found; \
+	fi
 	kubectl apply -k k8s/observability
-	helm upgrade --install mimir grafana/mimir-distributed \
-		--version $(MIMIR_VERSION) -n $(OBS_NS) \
-		-f k8s/observability/values/mimir-values.yaml --wait --timeout 10m
+	kubectl -n $(OBS_NS) rollout status statefulset/mimir --timeout=10m
 	helm upgrade --install loki grafana/loki \
 		--version $(LOKI_VERSION) -n $(OBS_NS) \
 		-f k8s/observability/values/loki-values.yaml --wait --timeout 10m

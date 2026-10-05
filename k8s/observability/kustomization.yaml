@@ -1,8 +1,9 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# The LGTM stack itself is installed with Helm (see values/ and the Makefile);
-# this kustomization only carries the Collector.
+# Loki, Tempo and Grafana are installed with Helm (see values/ and the
+# Makefile); this kustomization carries Mimir and the Collector.
 resources:
   - namespace.yaml
+  - mimir.yaml
   - otel-collector.yaml
