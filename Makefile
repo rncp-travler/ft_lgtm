@@ -34,9 +34,19 @@ helm_install = helm upgrade --install $(1) $(2) --version $(3) -n $(OBS_NS) \
 	-f $(VALUES_DIR)/$(1)-values.yaml --wait --timeout 10m >/dev/null
 
 # Third-party images the stack runs, read from the rendered charts and
-# manifests so the list always follows the pinned versions. `images` pulls
-# them on the host and `load` imports them, so the host Docker cache survives
-# `make down` and a rebuilt cluster downloads nothing.
+# manifests so the list always follows the pinned versions. With PRELOAD=1,
+# `images` pulls them on the host and `load` imports them, so the host Docker
+# cache survives `make down` and a rebuilt cluster downloads nothing. That
+# keeps every image twice (host + node, ~2.5GB extra), too much for a small VM
+# disk, so by default the node pulls them itself and stores them once.
+PRELOAD        ?= 0
+
+# Free space, in GB, on the Docker data root: under MIN_FREE_GB `make up`
+# stops before it starts, under WARN_FREE_GB it only warns. A full run needs
+# roughly 12GB (build cache ~5GB, app images ~1GB twice, stack ~2.5GB, data).
+MIN_FREE_GB    ?= 10
+WARN_FREE_GB   ?= 20
+
 STACK_IMAGES = { \
 	helm template loki grafana/loki --version $(LOKI_VERSION) --skip-tests -f $(VALUES_DIR)/loki-values.yaml; \
 	helm template tempo grafana-community/tempo --version $(TEMPO_VERSION) --skip-tests -f $(VALUES_DIR)/tempo-values.yaml; \
@@ -78,7 +88,7 @@ RUSTUP_ENV := RUSTUP_HOME=$${RUSTUP_HOME:-$$HOME/.rustup} \
               CARGO_HOME=$${CARGO_HOME:-$$HOME/.cargo}
 
 .PHONY: all up packages install-apt install-docker install-k3d install-kubectl \
-        install-helm check-docker install toolchain install-go install-rust \
+        install-helm check-docker check-disk prune install toolchain install-go install-rust \
         versions check-wasm cluster helm-repos images load observability deploy dashboards \
         hosts unhosts status logs dev back front build build-backend \
         build-frontend test lint fmt down clean fclean re help
@@ -86,7 +96,7 @@ RUSTUP_ENV := RUSTUP_HOME=$${RUSTUP_HOME:-$$HOME/.rustup} \
 all: up
 
 ## up: install the tooling, create the cluster, build and deploy everything
-up: packages check-docker cluster images load observability deploy dashboards hosts
+up: packages check-docker check-disk cluster images load observability deploy dashboards hosts
 	@echo ""
 	@echo "Stack is up:"
 	@echo "  http://lgtm.local          playground"
@@ -120,10 +130,17 @@ install-docker:
 		exit 1; \
 	else \
 		echo "[docker] installing docker.io"; \
-		sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker.io; \
+		sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker.io docker-buildx; \
 		sudo systemctl enable --now docker; \
 		sudo usermod -aG docker $$USER; \
 		echo "[docker] added $$USER to the docker group - log out and back in before 'make up'"; \
+	fi
+	@# Without buildx, Debian's docker.io falls back to the legacy builder,
+	@# which keeps every intermediate stage as a dangling image on disk.
+	@if command -v docker >/dev/null 2>&1 && ! docker buildx version >/dev/null 2>&1 \
+			&& [ "$(UNAME_S)" = "Linux" ] && command -v apt-get >/dev/null 2>&1; then \
+		echo "[docker] installing docker-buildx"; \
+		sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-buildx; \
 	fi
 
 ## install-k3d: install the k3d CLI
@@ -168,6 +185,34 @@ check-docker:
 		echo "then run 'make up' again."; \
 		exit 1; \
 	fi
+
+## check-disk: stop early when the Docker disk is too small for the stack
+check-disk:
+	@root=$$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker); \
+	[ -d "$$root" ] || root=/; \
+	free=$$(df -Pk "$$root" 2>/dev/null | awk 'NR==2 {print int($$4/1024/1024)}'); \
+	if [ -z "$$free" ]; then \
+		echo "[disk]   cannot read the free space of $$root, skipping the check"; \
+	elif [ "$$free" -lt $(MIN_FREE_GB) ]; then \
+		echo "[disk]   only $${free}GB free on $$root, need at least $(MIN_FREE_GB)GB."; \
+		echo "         Try 'make prune', grow the VM disk, or override with MIN_FREE_GB=<n>."; \
+		docker system df 2>/dev/null; \
+		exit 1; \
+	elif [ "$$free" -lt $(WARN_FREE_GB) ]; then \
+		echo "[disk]   $${free}GB free on $$root; tight, $(WARN_FREE_GB)GB+ is comfortable"; \
+	else \
+		echo "[disk]   $${free}GB free on $$root"; \
+	fi
+
+## prune: reclaim Docker disk space (build cache, dangling and unused images)
+prune:
+	-docker builder prune -af
+	-docker image prune -f
+	@# Keep the app images the cluster was loaded from; drop unused third-party ones.
+	-docker image ls --format '{{.Repository}}:{{.Tag}}' \
+		| grep -v '^ft_lgtm/' | grep -v '<none>' | grep -v '^rancher/\|^ghcr.io/k3d-io/' \
+		| xargs -r docker rmi 2>/dev/null
+	@docker system df
 
 # ---------------------------------------------------------------------------
 # Host toolchains (only for `make dev` and `make test`)
@@ -272,16 +317,21 @@ helm-repos:
 
 ## images: build both app images while the stack images are pulled on the host
 images: helm-repos
-	@echo "[pull]   pulling the stack images in the background"
-	@$(STACK_IMAGES) | xargs -n 1 -P 4 docker pull -q >/dev/null & pull=$$!; \
+	@pull=; \
+	if [ "$(PRELOAD)" = 1 ]; then \
+		echo "[pull]   pulling the stack images in the background"; \
+		$(STACK_IMAGES) | xargs -n 1 -P 4 docker pull -q >/dev/null & pull=$$!; \
+	fi; \
 	docker build -t $(BACKEND_IMAGE) ./$(BACKEND_DIR) \
 		&& docker build -t $(FRONTEND_IMAGE) ./$(FRONTEND_DIR); \
 	built=$$?; \
-	if wait $$pull; then echo "[pull]   stack images ready on the host"; \
+	if [ -z "$$pull" ]; then :; \
+	elif wait $$pull; then echo "[pull]   stack images ready on the host"; \
 	else echo "[pull]   some stack images failed to pull, the cluster will fetch those itself"; fi; \
+	docker image prune -f >/dev/null; \
 	exit $$built
 
-## load: import the app images, and the stack images the cluster lacks
+## load: import the app images, and with PRELOAD=1 the stack images the cluster lacks
 # Not `k3d image import`: with Docker's containerd image store, `docker save`
 # lists every platform of a pulled image but only holds the local one, the
 # node's import then fails on the missing content, and k3d still reports
@@ -290,7 +340,7 @@ images: helm-repos
 # `save --platform` uses the classic store, which never has the problem.
 load: helm-repos
 	@imgs="$(BACKEND_IMAGE) $(FRONTEND_IMAGE)"; \
-	for i in $$($(STACK_IMAGES)); do \
+	[ "$(PRELOAD)" = 1 ] && for i in $$($(STACK_IMAGES)); do \
 		docker image inspect "$$i" >/dev/null 2>&1 || continue; \
 		docker exec $(K3D_NODE) crictl inspecti "$$i" >/dev/null 2>&1 && continue; \
 		imgs="$$imgs $$i"; \
@@ -424,10 +474,11 @@ down:
 clean:
 	rm -rf $(BACKEND_DIR)/bin $(FRONTEND_DIR)/dist
 
-## fclean: clean, delete the cluster, the node modules and the local images
+## fclean: clean, delete the cluster, the node modules, the local images and the build cache
 fclean: clean down
 	rm -rf $(FRONTEND_DIR)/node_modules
 	-docker rmi $(BACKEND_IMAGE) $(FRONTEND_IMAGE)
+	-docker builder prune -af
 
 ## re: tear everything down and bring it back up
 re: fclean up

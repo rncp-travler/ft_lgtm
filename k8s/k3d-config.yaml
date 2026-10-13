@@ -19,6 +19,25 @@ options:
   k3d:
     wait: true
     timeout: 5m
+  # The kubelet defaults are sized for real nodes, not a small VM disk shared
+  # with Docker: past 85% it garbage-collects images (including the imported
+  # ft_lgtm/* ones, which no registry can give back), and under 5% free it
+  # taints the node with disk-pressure and evicts pods. Only stop on a truly
+  # full disk; `make check-disk` warns well before that.
+  k3s:
+    extraArgs:
+      - arg: --kubelet-arg=eviction-hard=imagefs.available<1%,nodefs.available<1%
+        nodeFilters:
+          - server:*
+      - arg: --kubelet-arg=eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%
+        nodeFilters:
+          - server:*
+      - arg: --kubelet-arg=image-gc-high-threshold=99
+        nodeFilters:
+          - server:*
+      - arg: --kubelet-arg=image-gc-low-threshold=98
+        nodeFilters:
+          - server:*
   kubeconfig:
     updateDefaultKubeconfig: true
     switchCurrentContext: true
