@@ -123,14 +123,21 @@ install-apt:
 
 ## install-docker: install Docker from the Debian repository and enable it
 install-docker:
+	@# On trixie the CLI is its own package (docker-cli) that docker.io only
+	@# recommends, so --no-install-recommends would leave the daemon without a
+	@# docker command. Older releases ship neither package, hence the probe.
 	@if command -v docker >/dev/null 2>&1; then \
 		echo "[docker] $$(docker --version), skipping"; \
 	elif [ "$(UNAME_S)" != "Linux" ] || ! command -v apt-get >/dev/null 2>&1; then \
 		echo "[docker] not found; install Docker Desktop on $(UNAME_S)"; \
 		exit 1; \
 	else \
-		echo "[docker] installing docker.io"; \
-		sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker.io docker-buildx; \
+		pkgs=docker.io; \
+		for p in docker-cli docker-buildx; do \
+			apt-cache show "$$p" >/dev/null 2>&1 && pkgs="$$pkgs $$p"; \
+		done; \
+		echo "[docker] installing $$pkgs"; \
+		sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $$pkgs; \
 		sudo systemctl enable --now docker; \
 		sudo usermod -aG docker $$USER; \
 		echo "[docker] added $$USER to the docker group - log out and back in before 'make up'"; \
