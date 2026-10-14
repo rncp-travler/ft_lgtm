@@ -546,6 +546,16 @@ IPFS_TEST_GW   ?= 18080
 
 ## test-ipfs: integration test of the IPFS client against a throwaway kubo
 test-ipfs:
+	@# The cluster pulled kubo inside its node, so the host may not have it,
+	@# and Docker Hub may be unreachable or rate-limited on a campus network:
+	@# fall back to copying the node's copy (this platform only, see `load`).
+	@img=$(IPFS_IMAGE); \
+	if ! docker image inspect $$img >/dev/null 2>&1 && ! docker pull -q $$img >/dev/null 2>&1; then \
+		echo "[ipfs]   cannot pull $$img, copying it from $(K3D_NODE)"; \
+		docker exec $(K3D_NODE) ctr -n k8s.io images export --platform linux/$(ARCH) - docker.io/$$img \
+			| docker load >/dev/null \
+			|| { echo "[ipfs]   no copy in the cluster either; check the network or run 'make up'"; exit 1; }; \
+	fi
 	@name=ft_lgtm-ipfs-test; \
 	docker rm -f $$name >/dev/null 2>&1; \
 	echo "[ipfs]   starting $(IPFS_IMAGE) offline, api :$(IPFS_TEST_PORT) gateway :$(IPFS_TEST_GW)"; \
