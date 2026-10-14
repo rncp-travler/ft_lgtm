@@ -62,21 +62,27 @@ K3D_NODE        := k3d-$(CLUSTER)-server-0
 # Host toolchains, only needed for `make dev` / `make test`; the container
 # images carry their own compilers. GO_VERSION must satisfy the `go` directive
 # in backend/go.mod, and RUST_MIN is 1.85 because the compile stage passes
-# --edition 2024 to rustc. Override on the command line to move either one.
+# --edition 2024 to rustc. NODE_MIN follows the `engines` of vite 8
+# (^20.19 || >=22.12); NODE_VERSION matches the node:22 build image of the
+# frontend Dockerfile. Override on the command line to move any of them.
 GO_VERSION     ?= 1.27.1
+NODE_VERSION   ?= 22.23.3
+NODE_MIN       := 22.12.0
 RUST_VERSION   ?= 1.98.1
 RUST_MIN       := 1.85.0
 GO_REQUIRED    := $(shell awk '/^go /{print $$2; exit}' $(BACKEND_DIR)/go.mod)
 RUST_TARGET    := wasm32-wasip1
 
 GO_ROOT        := /usr/local/go
+NODE_ROOT      := /usr/local/node
 UNAME_S        := $(shell uname -s)
 UNAME_M        := $(shell uname -m)
 ARCH           := $(if $(filter aarch64 arm64,$(UNAME_M)),arm64,amd64)
+NODE_ARCH      := $(if $(filter arm64,$(ARCH)),arm64,x64)
 
 # Freshly installed tools land outside the default PATH, so every recipe below
 # sees them without the caller having to reload their shell first.
-export PATH := $(GO_ROOT)/bin:$(HOME)/.cargo/bin:/usr/local/bin:$(PATH)
+export PATH := $(GO_ROOT)/bin:$(NODE_ROOT)/bin:$(HOME)/.cargo/bin:/usr/local/bin:$(PATH)
 
 # Shell helper: ver_ge A B succeeds when version A >= version B.
 VER_GE := ver_ge() { [ "$$(printf '%s\n%s\n' "$$2" "$$1" | sort -V | head -n1)" = "$$2" ]; };
@@ -88,7 +94,7 @@ RUSTUP_ENV := RUSTUP_HOME=$${RUSTUP_HOME:-$$HOME/.rustup} \
               CARGO_HOME=$${CARGO_HOME:-$$HOME/.cargo}
 
 .PHONY: all up packages install-apt install-docker install-k3d install-kubectl \
-        install-helm check-docker check-disk prune install toolchain install-go install-rust \
+        install-helm check-docker check-disk prune install toolchain install-go install-rust install-node \
         versions check-wasm cluster helm-repos images load observability deploy dashboards \
         hosts unhosts status logs dev back front build build-backend \
         build-frontend test lint fmt down clean fclean re help
@@ -118,7 +124,7 @@ install-apt:
 		echo "[apt]    installing base packages"; \
 		sudo apt-get update -qq; \
 		sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-			build-essential ca-certificates curl git; \
+			build-essential ca-certificates curl git xz-utils; \
 	fi
 
 ## install-docker: install Docker from the Debian repository and enable it
@@ -229,8 +235,8 @@ prune:
 install: toolchain
 	cd $(FRONTEND_DIR) && npm install
 
-## toolchain: install or refresh the pinned Go and Rust toolchains, idempotent
-toolchain: install-apt install-go install-rust
+## toolchain: install or refresh the pinned Go, Rust and Node toolchains, idempotent
+toolchain: install-apt install-go install-rust install-node
 	@$(MAKE) --no-print-directory versions
 
 ## install-go: install the pinned Go into /usr/local/go unless it is current
@@ -254,6 +260,26 @@ install-go:
 		sudo tar -C /usr/local -xzf "$$tmp/go.tar.gz"; \
 		rm -rf "$$tmp"; \
 		echo "[go]     installed; add $(GO_ROOT)/bin to PATH in your shell profile"; \
+	fi
+
+## install-node: install the pinned Node into /usr/local/node unless it is current
+install-node:
+	@$(VER_GE) \
+	current=$$(node --version 2>/dev/null | sed 's/^v//'); \
+	if [ -n "$$current" ] && ver_ge "$$current" "$(NODE_MIN)"; then \
+		echo "[node]   $$current satisfies $(NODE_MIN), skipping"; \
+	elif [ "$(UNAME_S)" != "Linux" ]; then \
+		echo "[node]   need $(NODE_MIN)+, found $${current:-none}; install it from https://nodejs.org on $(UNAME_S)"; \
+		exit 1; \
+	else \
+		echo "[node]   installing $(NODE_VERSION) linux-$(NODE_ARCH) into $(NODE_ROOT)"; \
+		tmp=$$(mktemp -d); \
+		curl -fsSL "https://nodejs.org/dist/v$(NODE_VERSION)/node-v$(NODE_VERSION)-linux-$(NODE_ARCH).tar.xz" -o "$$tmp/node.tar.xz"; \
+		sudo rm -rf $(NODE_ROOT); \
+		sudo mkdir -p $(NODE_ROOT); \
+		sudo tar -C $(NODE_ROOT) --strip-components=1 -xJf "$$tmp/node.tar.xz"; \
+		rm -rf "$$tmp"; \
+		echo "[node]   installed; add $(NODE_ROOT)/bin to PATH in your shell profile"; \
 	fi
 
 ## install-rust: install rustup, the pinned toolchain and the wasm target
