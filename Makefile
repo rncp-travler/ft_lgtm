@@ -97,7 +97,7 @@ RUSTUP_ENV := RUSTUP_HOME=$${RUSTUP_HOME:-$$HOME/.rustup} \
         install-helm check-docker check-disk prune install toolchain install-go install-rust install-node \
         versions check-wasm cluster helm-repos images load observability deploy dashboards \
         hosts unhosts status logs dev back front build build-backend \
-        build-frontend test lint fmt down clean fclean re help
+        build-frontend test test-ipfs ipfs-check lint fmt down clean fclean re help
 
 all: up
 
@@ -372,6 +372,11 @@ images: helm-repos
 # that and lets a failure stop the build. Older Docker without
 # `save --platform` uses the classic store, which never has the problem.
 load: helm-repos
+	@case "$$(docker inspect -f '{{.State.Running}}' $(K3D_NODE) 2>/dev/null)" in \
+	true) ;; \
+	false) echo "[load]   cluster $(CLUSTER) is stopped; run 'k3d cluster start $(CLUSTER)' first"; exit 1 ;; \
+	*) echo "[load]   no cluster $(CLUSTER) on this machine; run 'make cluster' (or 'make up') first"; exit 1 ;; \
+	esac
 	@imgs="$(BACKEND_IMAGE) $(FRONTEND_IMAGE)"; \
 	[ "$(PRELOAD)" = 1 ] && for i in $$($(STACK_IMAGES)); do \
 		docker image inspect "$$i" >/dev/null 2>&1 || continue; \
@@ -384,6 +389,12 @@ load: helm-repos
 	printf '           %s\n' $$imgs; \
 	docker save $$platform $$imgs \
 		| docker exec -i $(K3D_NODE) ctr -n k8s.io images import - >/dev/null
+	@# The tag stays :dev, so running pods would keep the old image; restart
+	@# the ones that already exist (none on a fresh cluster).
+	@for d in backend frontend; do \
+		kubectl -n $(APP_NS) get deployment $$d >/dev/null 2>&1 \
+			&& kubectl -n $(APP_NS) rollout restart deployment/$$d; \
+	done; true
 
 ## observability: install the LGTM stack and the OpenTelemetry Collector
 observability: helm-repos
@@ -416,10 +427,19 @@ observability: helm-repos
 	kubectl -n $(OBS_NS) rollout status deployment/otel-collector --timeout=5m
 
 ## deploy: apply the application manifests
+# kubo reads its init scripts only at start-up and a ConfigMap edit does not
+# restart the pod, so restart it when ipfs-init changed.
 deploy:
-	kubectl apply -k k8s/base
+	@before=$$(kubectl -n $(APP_NS) get configmap ipfs-init -o jsonpath='{.data}' 2>/dev/null); \
+	kubectl apply -k k8s/base || exit 1; \
+	after=$$(kubectl -n $(APP_NS) get configmap ipfs-init -o jsonpath='{.data}'); \
+	if [ -n "$$before" ] && [ "$$before" != "$$after" ]; then \
+		echo "[ipfs]   init scripts changed, restarting kubo"; \
+		kubectl -n $(APP_NS) rollout restart statefulset/ipfs; \
+	fi
 	kubectl -n $(APP_NS) rollout status deployment/backend --timeout=5m
 	kubectl -n $(APP_NS) rollout status deployment/frontend --timeout=5m
+	kubectl -n $(APP_NS) rollout status statefulset/ipfs --timeout=5m
 
 ## dashboards: provision the Grafana dashboards from dashboards/
 dashboards:
@@ -441,6 +461,39 @@ hosts:
 ## unhosts: remove the lgtm.local entries again
 unhosts:
 	@sudo sed -i'' -e '/lgtm\.local/d' /etc/hosts && echo "removed lgtm.local entries from /etc/hosts"
+
+## ipfs-check: is the IPFS node on the public network? CID=<cid> also announces and looks it up
+ipfs-check:
+	@kubo="kubectl -n $(APP_NS) exec ipfs-0 -c kubo --"; \
+	$$kubo ipfs id >/dev/null 2>&1 || { echo "[ipfs]   ipfs-0 is not running; try 'make deploy'"; exit 1; }; \
+	echo "[ipfs]   peer id: $$($$kubo ipfs id -f '<id>')"; \
+	for key in Swarm.RelayClient.Enabled Swarm.EnableHolePunching; do \
+		echo "[ipfs]   $$key = $$($$kubo ipfs config $$key 2>/dev/null || echo unset)"; \
+	done; \
+	peers=$$($$kubo ipfs swarm peers 2>/dev/null | wc -l | tr -d ' '); \
+	echo "[ipfs]   connected peers: $$peers"; \
+	if [ "$$peers" -eq 0 ]; then \
+		echo "         none: outbound traffic to the IPFS network is blocked here"; \
+		echo "         (campus firewall?). Try a phone hotspot."; \
+		exit 1; \
+	fi; \
+	circuits=$$($$kubo ipfs id -f '<addrs>' | grep p2p-circuit); \
+	if [ -n "$$circuits" ]; then \
+		echo "[ipfs]   relay addresses (any one is the Multiaddr for check.ipfs.network):"; \
+		echo "$$circuits" | head -3 | sed 's/^/           /'; \
+	else \
+		echo "[ipfs]   no relay address yet: the node is either publicly reachable or"; \
+		echo "         still looking for a relay (takes ~1 min after start); run again"; \
+	fi; \
+	if [ -n "$(CID)" ]; then \
+		echo "[ipfs]   announcing $(CID) to the DHT (up to 2 min)"; \
+		$$kubo ipfs routing provide --timeout=2m $(CID) >/dev/null 2>&1 \
+			&& echo "[ipfs]   announced" || echo "[ipfs]   announce did not finish, the node retries on its own"; \
+		echo "[ipfs]   the network should list this node ($$($$kubo ipfs id -f '<id>')) as a provider:"; \
+		echo "           https://delegated-ipfs.dev/routing/v1/providers/$(CID)"; \
+		echo "[ipfs]   then open from another network: https://ipfs.io/ipfs/$(CID)/"; \
+		echo "         (502 = found but not retrievable: the NATs block the direct connection)"; \
+	fi
 
 ## status: show what is running
 status:
@@ -485,6 +538,31 @@ build-frontend:
 test:
 	cd $(BACKEND_DIR) && go test ./...
 	cd $(FRONTEND_DIR) && npm run lint && npm run type-check
+
+# Same kubo the cluster runs, read from the manifest so the two never drift.
+IPFS_IMAGE     = $(shell sed -n 's/^[[:space:]]*image:[[:space:]]*\(ipfs\/kubo:[^[:space:]]*\).*/\1/p' k8s/base/ipfs.yaml)
+IPFS_TEST_PORT ?= 15001
+IPFS_TEST_GW   ?= 18080
+
+## test-ipfs: integration test of the IPFS client against a throwaway kubo
+test-ipfs:
+	@name=ft_lgtm-ipfs-test; \
+	docker rm -f $$name >/dev/null 2>&1; \
+	echo "[ipfs]   starting $(IPFS_IMAGE) offline, api :$(IPFS_TEST_PORT) gateway :$(IPFS_TEST_GW)"; \
+	docker run -d --name $$name -p 127.0.0.1:$(IPFS_TEST_PORT):5001 \
+		-p 127.0.0.1:$(IPFS_TEST_GW):8080 \
+		$(IPFS_IMAGE) daemon --offline >/dev/null || exit 1; \
+	trap 'docker rm -f '$$name' >/dev/null' EXIT; \
+	ready=; \
+	for i in $$(seq 60); do \
+		curl -fsS -X POST http://127.0.0.1:$(IPFS_TEST_PORT)/api/v0/version >/dev/null 2>&1 \
+			&& ready=1 && break; \
+		sleep 1; \
+	done; \
+	[ -n "$$ready" ] || { echo "[ipfs]   kubo did not come up"; docker logs $$name; exit 1; }; \
+	cd $(BACKEND_DIR) && IPFS_API_URL=http://127.0.0.1:$(IPFS_TEST_PORT) \
+		IPFS_GATEWAY_URL=http://127.0.0.1:$(IPFS_TEST_GW) \
+		go test -tags integration -count=1 -run Integration -v ./src/internal/ipfs/
 
 ## lint: static checks only
 lint:

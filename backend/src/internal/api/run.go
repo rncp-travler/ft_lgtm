@@ -46,22 +46,27 @@ type RunResponse struct {
 	TraceID    string `json:"traceId,omitempty"`
 }
 
-// sharedResult is what gets pinned to IPFS behind the share link.
-type sharedResult struct {
-	Language  string    `json:"language"`
-	Code      string    `json:"code"`
-	Status    string    `json:"status"`
-	Stdout    string    `json:"stdout"`
-	Stderr    string    `json:"stderr"`
-	ExitCode  int32     `json:"exitCode"`
-	CreatedAt time.Time `json:"createdAt"`
+// resultMeta is result.json in the shared directory. It has no timestamp on
+// purpose: the same code with the same output must give the same CID.
+type resultMeta struct {
+	Language string `json:"language"`
+	Target   string `json:"target"`
+	Status   string `json:"status"`
+	ExitCode int32  `json:"exitCode"`
+}
+
+// Publisher pins a run's files and builds the link to them; *ipfs.Client in
+// production, a test double in the unit tests.
+type Publisher interface {
+	UploadDir(ctx context.Context, files []ipfs.File) (cid string, err error)
+	ShareURL(cid string) string
 }
 
 type Server struct {
 	Compiler       compiler.Rust
 	CompileTimeout time.Duration
 	Runtime        *sandbox.Runtime
-	IPFS           *ipfs.Client
+	IPFS           Publisher
 	Metrics        *telemetry.Metrics
 	MaxCodeBytes   int64
 }
@@ -153,16 +158,33 @@ func (s *Server) run(ctx context.Context, code string) RunResponse {
 		}
 	}
 
-	// Share even failed runs so people can link to the error. Upload is best-effort.
-	payload, _ := json.Marshal(sharedResult{
-		Language: "rust", Code: code, Status: resp.Status,
-		Stdout: resp.Stdout, Stderr: resp.Stderr, ExitCode: resp.ExitCode,
-		CreatedAt: time.Now().UTC(),
-	})
-	if cid, err := s.IPFS.Upload(ctx, "result.json", payload); err != nil {
-		slog.WarnContext(ctx, "ipfs upload failed", "error", err)
-	} else {
-		resp.CID, resp.ShareURL = cid, s.IPFS.ShareURL(cid)
-	}
+	// Share even failed runs so people can link to the error.
+	s.share(ctx, code, &resp)
 	return resp
+}
+
+// share pins the run as a directory and sets resp's CID and link. It is
+// best-effort: a failed upload is logged and the run result still goes out.
+func (s *Server) share(ctx context.Context, code string, resp *RunResponse) {
+	cid, err := s.IPFS.UploadDir(ctx, shareFiles(code, *resp))
+	if err != nil {
+		slog.WarnContext(ctx, "ipfs upload failed", "error", err)
+		return
+	}
+	resp.CID, resp.ShareURL = cid, s.IPFS.ShareURL(cid)
+}
+
+// shareFiles is the directory behind the share link. Every file is always
+// present, empty or not, so the layout does not depend on the result.
+func shareFiles(code string, resp RunResponse) []ipfs.File {
+	meta, _ := json.MarshalIndent(resultMeta{
+		Language: "rust", Target: compiler.Target,
+		Status: resp.Status, ExitCode: resp.ExitCode,
+	}, "", "  ")
+	return []ipfs.File{
+		{Name: "main.rs", Data: []byte(code)},
+		{Name: "stdout.txt", Data: []byte(resp.Stdout)},
+		{Name: "stderr.txt", Data: []byte(resp.Stderr)},
+		{Name: "result.json", Data: append(meta, '\n')},
+	}
 }

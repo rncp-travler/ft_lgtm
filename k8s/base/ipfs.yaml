@@ -22,6 +22,20 @@ data:
         "NoDNSLink": true
       }
     }'
+  02-reachability.sh: |
+    #!/bin/sh
+    set -e
+    # The node sits behind three NATs (k3d network, the VM, the campus or
+    # hotspot router) and the last one cannot be port-forwarded, so public
+    # gateways cannot dial it directly. Instead the node keeps an outbound
+    # reservation on public relays and advertises /p2p-circuit addresses.
+    # A gateway reaches it through the relay, but bitswap sends no data over
+    # a relayed (limited) connection: hole punching (DCUtR) then has the node
+    # dial the gateway directly, which works because the gateway is public.
+    # Two NATed peers may still fail to connect, so test from a gateway.
+    # Both are kubo defaults today; pinned so an upgrade cannot drop them.
+    ipfs config --json Swarm.RelayClient.Enabled true
+    ipfs config --json Swarm.EnableHolePunching true
 ---
 apiVersion: apps/v1
 kind: StatefulSet
