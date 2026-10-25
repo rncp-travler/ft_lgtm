@@ -142,7 +142,7 @@ Pinned tool versions (Makefile): k3d v5.9.0, kubectl v1.37.1, Helm v3.22.1, Dock
 
 ## Security model
 
-User code is untrusted, and its output is pinned on our IPFS node, and once someone else has fetched it, it cannot be reliably taken back. So there are two separate boundaries: the **run** boundary (WASI sandbox) and the **compile** boundary (compiler pod).
+User code is untrusted. Its output is pinned on our IPFS node, and once someone else has fetched it, it cannot be reliably taken back. So there are two separate boundaries: the **run** boundary (WASI sandbox) and the **compile** boundary (compiler pod).
 
 ### Run: WASI sandbox (inside the backend, `backend/internal/wasmexec/wasmexec.go`)
 
@@ -241,7 +241,7 @@ To show a working public fetch in a defence you need a network where the router 
 ## Demo walkthrough
 
 1. Open <http://lgtm.local> in the VM's Firefox. Press **Run** on the example a few times; also try an infinite loop (`loop {}` → "Time limit exceeded (5s)"), `vec![0u8; 100_000_000]` (memory limit) and a program that prints a lot (truncated at 10 KiB).
-2. Wait about 30 seconds so the metrics are exported to Mimir (the backend pushes every 5 s) and visible.
+2. Wait about 30 seconds so the metrics reach Mimir (the backend pushes them to the Collector every 5 s) and become visible.
 3. Open <http://grafana.lgtm.local> → **LGTM Metrics**. Show the success/failure counts and the p95 duration graph.
 4. Click an **exemplar** dot on the duration graph → the **trace** opens in Tempo (`POST /api/execute` → `compile` → `rustc` → `execute` → `ipfs.upload`; two services in one trace).
 5. In a span click **Related logs** (the assignment's "Logs for this span") → the Loki lines for exactly that span.
