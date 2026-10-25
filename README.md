@@ -142,7 +142,7 @@ Pinned tool versions (Makefile): k3d v5.9.0, kubectl v1.37.1, Helm v3.22.1, Dock
 
 ## Security model
 
-User code is untrusted, and its output is published on IPFS forever. So there are two separate boundaries: the **run** boundary (WASI sandbox) and the **compile** boundary (compiler pod).
+User code is untrusted. Its output is pinned on our IPFS node, and once someone else has fetched it, it cannot be reliably taken back. So there are two separate boundaries: the **run** boundary (WASI sandbox) and the **compile** boundary (compiler pod).
 
 ### Run: WASI sandbox (inside the backend, `backend/internal/wasmexec/wasmexec.go`)
 
@@ -152,13 +152,13 @@ User code is untrusted, and its output is published on IPFS forever. So there ar
 | Filesystem | none | No preopened directories; no inherited env or args |
 | Memory | 10 MiB | Wasmtime store limiter |
 | Time | 5 s wall-clock | Epoch interruption, ticked every 100 ms |
-| Output | 10 kB total (stdout + stderr) | `fd_write` is replaced by a Go function that writes into capped in-memory buffers; excess is dropped and `truncated` is set. Nothing is written to disk |
-| Request body | 64 KB | `413` before the body is read |
+| Output | 10 KiB total (stdout + stderr) | `fd_write` is replaced by a Go function that writes into capped in-memory buffers; excess is dropped and `truncated` is set. Nothing is written to disk |
+| Request body | 64 KiB | `413` before the body is read |
 | Concurrent runs | 2, queue 8 | The 11th concurrent request gets `429`; waits are capped at 45 s |
 | Compile time | 15 s | `rustc` is killed and reported as a compile error |
 | IPFS upload | 10 s | After that the result is returned without a link |
 
-Acceptance cases covered by `scripts/verify/`: infinite loop → timeout, 100 MB allocation → `memory_limit`, `std::fs::read("/etc/passwd")` fails, `TcpStream::connect` fails, 1 MB output → truncated at 10 kB, 20 concurrent requests → 10 served, 10 rejected with `429`.
+Acceptance cases covered by `scripts/verify/`: infinite loop → timeout, 100 MB allocation → `memory_limit`, `std::fs::read("/etc/passwd")` fails, `TcpStream::connect` fails, 1 MiB output → truncated at 10 KiB, 20 concurrent requests → 10 served, 10 rejected with `429`.
 
 ### Compile: isolated compiler pod (`k8s/app/compiler.yaml`)
 
@@ -207,7 +207,7 @@ A policy that "seems" to work proves little, so the verify scripts use a control
 
 **What does not (in the tested environments).** Opening the same CID on a public gateway needs a public node to fetch the blocks from our node over the IPFS swarm, which means our port 4001 must be reachable from the internet. A VM behind NAT is not reachable: Kubo reports AutoNAT `Private`, has no public direct address, and only advertises relay (`/p2p-circuit`) addresses. Port 4001 is mapped from the VM into the k3d node, but the VM sits behind UTM's NAT and, behind that, the router.
 
-**Diagnosing: `make ipfs-check`.** It is deliberately not part of `make`, because it depends on the network and takes about 1.5 minutes. It adds a small test file to the node and prints `S1`…`S9` checks (VM-internal 4001, swarm peers, our addresses, AutoNAT, local gateway, delegated routing advertisement, an external probe, and five public gateways), then one summary line:
+**Diagnosing: `make ipfs-check`.** It is deliberately not part of `make`, because it depends on the network and takes about 1.5 minutes. It prints `S1`…`S9` checks (S1 VM-internal 4001, S2 swarm peers, S3 our addresses, S4 AutoNAT, S5 test file add + pin + provide, S6 local gateway, S7 delegated routing advertisement, S8 an external probe, S9 five public gateways), then one summary line:
 
 ```
 SUMMARY first_blocked=<vm-4001|utm|router|internet|none|unknown> reason=...
@@ -240,8 +240,8 @@ To show a working public fetch in a defence you need a network where the router 
 
 ## Demo walkthrough
 
-1. Open <http://lgtm.local> in the VM's Firefox. Press **Run** on the example a few times; also try an infinite loop (`loop {}` → "Time limit exceeded (5s)"), `vec![0u8; 100_000_000]` (memory limit) and a program that prints a lot (truncated at 10 kB).
-2. Wait about 30 seconds so the metrics are scraped and visible.
+1. Open <http://lgtm.local> in the VM's Firefox. Press **Run** on the example a few times; also try an infinite loop (`loop {}` → "Time limit exceeded (5s)"), `vec![0u8; 100_000_000]` (memory limit) and a program that prints a lot (truncated at 10 KiB).
+2. Wait about 30 seconds so the metrics reach Mimir (the backend pushes them to the Collector every 5 s) and become visible.
 3. Open <http://grafana.lgtm.local> → **LGTM Metrics**. Show the success/failure counts and the p95 duration graph.
 4. Click an **exemplar** dot on the duration graph → the **trace** opens in Tempo (`POST /api/execute` → `compile` → `rustc` → `execute` → `ipfs.upload`; two services in one trace).
 5. In a span click **Related logs** (the assignment's "Logs for this span") → the Loki lines for exactly that span.
@@ -297,7 +297,7 @@ The author designed the project skeleton and its core logic before any code was 
 
 **Design and decisions (author)**
 - **Stack**: Rust compiled to WASM and run under WASI with wasmtime-go, k3d, the LGTM stack behind a single OpenTelemetry Collector, raw manifests instead of Helm.
-- **Security model**: the execution limits (10 MB memory, 5 s, 10 kB output, 64 KB request body, 2 running + 8 queued), the two-layer defense for the compile step (a source deny-list, with pod isolation as the final layer), the NetworkPolicy scope, and the rule that no user input appears in traces or logs.
+- **Security model**: the execution limits (10 MiB memory, 5 s, 10 KiB output, 64 KiB request body, 2 running + 8 queued), the two-layer defense for the compile step (a source deny-list, with pod isolation as the final layer), the NetworkPolicy scope, and the rule that no user input appears in traces or logs.
 - **How the work was delivered**: the project was split into features across milestones M0–M6. Each feature had a written scope, an out-of-scope list, and acceptance criteria that could be checked by running a command.
 - **Engineering rules**, kept in `CLAUDE.md`: a failing verify script is committed before the implementation; only commands actually run on the VM count as verified; one VM lock across parallel sessions; every make target idempotent; no manual configuration (Grafana only through provisioning files); any deviation from the PRD is stopped and asked as an explicit "PRD change".
 - **Review**: every implementation plan was approved or sent back before coding started, and every result was reviewed before merging.

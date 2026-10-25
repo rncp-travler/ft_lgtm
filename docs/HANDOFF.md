@@ -10,6 +10,27 @@
 ### 다음 단계
 -->
 
+## F-M6-xx readme-fixes (브랜치 docs/readme-fixes)
+
+README.md 문구만 바꿨다. 코드, Makefile, scripts, manifest는 바꾸지 않았다. Helm 관련은 범위 밖으로 두었다.
+
+### 한 일
+- Security model 첫 문단: "published on IPFS forever" → "User code is untrusted. Its output is pinned on our IPFS node, and once someone else has fetched it, it cannot be reliably taken back." 근거: backend가 `/api/v0/add?pin=true`로 올리고(`backend/internal/ipfs/client.go`), Kubo 데이터는 PVC다(`k8s/ipfs/kubo.yaml` volumeClaimTemplates).
+- Demo walkthrough 2번: "scraped" → "reach Mimir (the backend pushes them to the Collector every 5 s)". Collector receiver는 otlp뿐이고 prometheus scrape는 없다. backend `metricExportInterval = 5 * time.Second`. batch 기본값 숫자는 쓰지 않았다(`batch: {}`, 기본값 미확인). README에서 scrape는 이 1곳뿐이었다.
+- 한도 단위 통일: Output 10 KiB(`OutputLimit = 10240`), Request body 64 KiB(`maxBodyBytes = 64 * 1024`), Memory 10 MiB(`10 << 20`). Security 표, 표 아래 acceptance 문장, Demo 1번, Use of AI 섹션.
+- 테스트 입력값: `m2-03-wasmtime-exec.sh`의 `vec![0u8; 100_000_000]`은 100,000,000 B라 "100 MB"를 유지했다. 출력 케이스는 1024 B × 1024줄 = 1,048,576 B라 "1 MB" → "1 MiB"로 바꿨다.
+- IPFS and NAT Diagnosing: 괄호 안을 S1~S9와 1:1로 바꾸고 S5(test file add + pin + provide)를 넣었다. 앞 문장의 "adds a small test file"은 S5와 겹쳐서 지웠다.
+
+### 된 것
+- 로컬 grep: 수정 후 README에 `scrap` 0건. kB/KB/MB 표기는 "100 MB allocation" 1건만 남았다(의도한 것).
+
+### 안 된 것
+- `scripts/verify/m6-01-readme.sh` VM 실행: 못 했다. lgtm-vm(192.168.64.8)이 ping과 ssh 22 모두 timeout이었고, lock도 잡지 않았다. 바꾼 줄에는 make 타겟, 경로, 버전 문자열이 없어서 영향은 없을 것으로 보지만 확인하지는 않았다.
+
+### 다음 단계
+- VM이 다시 뜨면 `m6-01-readme.sh`를 실행한다.
+- Helm 설치 제거 여부 결정(별도 피처). 지금 helm은 `scripts/setup/install.sh`에서 설치하고 `m0-01` verify에서 버전만 확인한다. `helm install/upgrade/template` 호출은 0건이다.
+
 ## F-M6-07 comment-cleanup (브랜치 chore/m6-07-comment-cleanup)
 
 코드 주석과 dashboard description만 바꿨다. 코드, 설정 값, 스크립트 로직, 테스트 단언은 바꾸지 않았다. VM 검증은 하지 않았다(사용자 지시: 주석만 변경). 확인은 로컬 diff로 했다.
